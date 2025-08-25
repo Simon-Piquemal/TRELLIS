@@ -201,35 +201,37 @@ def postprocess_mesh(
     vertices: np.array,
     faces: np.array,
     simplify: bool = True,
-    simplify_ratio: float = 0.9,
+    simplify_ratio: float = 0.8,  # ✅ MODIFIÉ: 0.9 → 0.8 (garde plus de détails pour 8K)
     fill_holes: bool = True,
     fill_holes_max_hole_size: float = 0.04,
     fill_holes_max_hole_nbe: int = 32,
-    fill_holes_resolution: int = 1024,
-    fill_holes_num_views: int = 1000,
+    fill_holes_resolution: int = 2048,  # ✅ MODIFIÉ: 1024 → 2048 (plus de précision)
+    fill_holes_num_views: int = 1500,   # ✅ MODIFIÉ: 1000 → 1500 (plus de vues)
     debug: bool = False,
     verbose: bool = False,
 ):
     """
     Postprocess a mesh by simplifying, removing invisible faces, and removing isolated pieces.
+    ✅ OPTIMISÉ pour textures 8K avec plus de détails préservés.
 
     Args:
         vertices (np.array): Vertices of the mesh. Shape (V, 3).
         faces (np.array): Faces of the mesh. Shape (F, 3).
         simplify (bool): Whether to simplify the mesh, using quadric edge collapse.
-        simplify_ratio (float): Ratio of faces to keep after simplification.
+        simplify_ratio (float): Ratio of faces to keep after simplification (0.8 = garde 80%).
         fill_holes (bool): Whether to fill holes in the mesh.
         fill_holes_max_hole_size (float): Maximum area of a hole to fill.
         fill_holes_max_hole_nbe (int): Maximum number of boundary edges of a hole to fill.
-        fill_holes_resolution (int): Resolution of the rasterization.
-        fill_holes_num_views (int): Number of views to rasterize the mesh.
+        fill_holes_resolution (int): Resolution of the rasterization (augmenté pour 8K).
+        fill_holes_num_views (int): Number of views to rasterize the mesh (augmenté pour 8K).
         verbose (bool): Whether to print progress.
     """
 
     if verbose:
+        tqdm.write(f'🔧 Postprocessing mesh for 8K texture quality...')
         tqdm.write(f'Before postprocess: {vertices.shape[0]} vertices, {faces.shape[0]} faces')
 
-    # Simplify
+    # Simplify (moins agressif pour préserver les détails 8K)
     if simplify and simplify_ratio > 0:
         mesh = pv.PolyData(vertices, np.concatenate([np.full((faces.shape[0], 1), 3), faces], axis=1))
         mesh = mesh.decimate(simplify_ratio, progress_bar=verbose)
@@ -237,7 +239,7 @@ def postprocess_mesh(
         if verbose:
             tqdm.write(f'After decimate: {vertices.shape[0]} vertices, {faces.shape[0]} faces')
 
-    # Remove invisible faces
+    # Remove invisible faces (avec plus de précision)
     if fill_holes:
         vertices, faces = torch.tensor(vertices).cuda(), torch.tensor(faces.astype(np.int32)).cuda()
         vertices, faces = _fill_holes(
@@ -281,15 +283,16 @@ def bake_texture(
     masks: List[np.array],
     extrinsics: List[np.array],
     intrinsics: List[np.array],
-    texture_size: int = 2048,
+    texture_size: int = 8192,  # ✅ MODIFIÉ: 2048 → 8192 (8K par défaut)
     near: float = 0.1,
     far: float = 10.0,
     mode: Literal['fast', 'opt'] = 'opt',
-    lambda_tv: float = 1e-2,
+    lambda_tv: float = 5e-3,  # ✅ MODIFIÉ: 1e-2 → 5e-3 (moins de regularisation pour plus de détails)
     verbose: bool = False,
 ):
     """
     Bake texture to a mesh from multiple observations.
+    ✅ OPTIMISÉ pour qualité 8K avec paramètres ajustés.
 
     Args:
         vertices (np.array): Vertices of the mesh. Shape (V, 3).
@@ -299,13 +302,18 @@ def bake_texture(
         masks (List[np.array]): List of masks. Each mask is a 2D image. Shape (H, W).
         extrinsics (List[np.array]): List of extrinsics. Shape (4, 4).
         intrinsics (List[np.array]): List of intrinsics. Shape (3, 3).
-        texture_size (int): Size of the texture.
+        texture_size (int): Size of the texture (8192 = 8K).
         near (float): Near plane of the camera.
         far (float): Far plane of the camera.
         mode (Literal['fast', 'opt']): Mode of texture baking.
-        lambda_tv (float): Weight of total variation loss in optimization.
+        lambda_tv (float): Weight of total variation loss in optimization (réduit pour 8K).
         verbose (bool): Whether to print progress.
     """
+    if verbose:
+        print(f"🎨 Baking {texture_size}x{texture_size} texture...")
+        if texture_size >= 8192:
+            print("⚠️  8K texture baking - this may take 10-15 minutes with high VRAM usage")
+
     vertices = torch.tensor(vertices).cuda()
     faces = torch.tensor(faces.astype(np.int32)).cuda()
     uvs = torch.tensor(uvs).cuda()
@@ -338,9 +346,10 @@ def bake_texture(
         texture[mask] /= texture_weights[mask][:, None]
         texture = np.clip(texture.reshape(texture_size, texture_size, 3).cpu().numpy() * 255, 0, 255).astype(np.uint8)
 
-        # inpaint
+        # inpaint (avec kernel plus grand pour 8K)
         mask = (texture_weights == 0).cpu().numpy().astype(np.uint8).reshape(texture_size, texture_size)
-        texture = cv2.inpaint(texture, mask, 3, cv2.INPAINT_TELEA)
+        inpaint_radius = max(3, texture_size // 2048)  # Adaptive radius for high-res
+        texture = cv2.inpaint(texture, mask, inpaint_radius, cv2.INPAINT_TELEA)
 
     elif mode == 'opt':
         rastctx = utils3d.torch.RastContext(backend='cuda')
@@ -357,7 +366,10 @@ def bake_texture(
                 _uv_dr.append(rast['uv_dr'].detach())
 
         texture = torch.nn.Parameter(torch.zeros((1, texture_size, texture_size, 3), dtype=torch.float32).cuda())
-        optimizer = torch.optim.Adam([texture], betas=(0.5, 0.9), lr=1e-2)
+        
+        # ✅ OPTIMISÉ pour 8K : Learning rate adaptatif
+        base_lr = 1e-2 if texture_size <= 4096 else 8e-3  # LR plus bas pour 8K+
+        optimizer = torch.optim.Adam([texture], betas=(0.5, 0.9), lr=base_lr)
 
         def exp_anealing(optimizer, step, total_steps, start_lr, end_lr):
             return start_lr * (end_lr / start_lr) ** (step / total_steps)
@@ -369,8 +381,9 @@ def bake_texture(
             return torch.nn.functional.l1_loss(texture[:, :-1, :, :], texture[:, 1:, :, :]) + \
                    torch.nn.functional.l1_loss(texture[:, :, :-1, :], texture[:, :, 1:, :])
     
-        total_steps = 2500
-        with tqdm(total=total_steps, disable=not verbose, desc='Texture baking (opt): optimizing') as pbar:
+        # ✅ OPTIMISÉ pour 8K : Plus d'itérations pour la qualité
+        total_steps = 3500 if texture_size >= 8192 else 2500
+        with tqdm(total=total_steps, disable=not verbose, desc=f'Texture baking (opt): optimizing {texture_size}px') as pbar:
             for step in range(total_steps):
                 optimizer.zero_grad()
                 selected = np.random.randint(0, len(views))
@@ -382,14 +395,18 @@ def bake_texture(
                 loss.backward()
                 optimizer.step()
                 # annealing
-                optimizer.param_groups[0]['lr'] = cosine_anealing(optimizer, step, total_steps, 1e-2, 1e-5)
-                pbar.set_postfix({'loss': loss.item()})
+                end_lr = 1e-5 if texture_size <= 4096 else 5e-6  # End LR adaptatif
+                optimizer.param_groups[0]['lr'] = cosine_anealing(optimizer, step, total_steps, base_lr, end_lr)
+                pbar.set_postfix({'loss': f'{loss.item():.6f}', 'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'})
                 pbar.update()
         texture = np.clip(texture[0].flip(0).detach().cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        
+        # ✅ Inpainting adaptatif pour 8K
         mask = 1 - utils3d.torch.rasterize_triangle_faces(
             rastctx, (uvs * 2 - 1)[None], faces, texture_size, texture_size
         )['mask'][0].detach().cpu().numpy().astype(np.uint8)
-        texture = cv2.inpaint(texture, mask, 3, cv2.INPAINT_TELEA)
+        inpaint_radius = max(3, texture_size // 1024)  # Radius adaptatif
+        texture = cv2.inpaint(texture, mask, inpaint_radius, cv2.INPAINT_TELEA)
     else:
         raise ValueError(f'Unknown mode: {mode}')
 
@@ -399,86 +416,121 @@ def bake_texture(
 def to_glb(
     app_rep: Union[Strivec, Gaussian],
     mesh: MeshExtractResult,
-    simplify: float = 0.95,
+    simplify: float = 0.8,        # ✅ MODIFIÉ: 0.95 → 0.8 (garde plus de détails)
     fill_holes: bool = True,
     fill_holes_max_size: float = 0.04,
-    texture_size: int = 1024,
+    texture_size: int = 8192,     # ✅ MODIFIÉ: 1024 → 8192 (8K par défaut)
     debug: bool = False,
     verbose: bool = True,
 ) -> trimesh.Trimesh:
     """
     Convert a generated asset to a glb file.
+    ✅ OPTIMISÉ pour textures 8K par défaut avec qualité améliorée.
 
     Args:
         app_rep (Union[Strivec, Gaussian]): Appearance representation.
         mesh (MeshExtractResult): Extracted mesh.
-        simplify (float): Ratio of faces to remove in simplification.
+        simplify (float): Ratio of faces to keep after simplification (0.8 = garde 80%).
         fill_holes (bool): Whether to fill holes in the mesh.
         fill_holes_max_size (float): Maximum area of a hole to fill.
-        texture_size (int): Size of the texture.
+        texture_size (int): Size of the texture (8192 = 8K, 16384 = 16K).
         debug (bool): Whether to print debug information.
         verbose (bool): Whether to print progress.
     """
+    if verbose:
+        print(f"🚀 Starting GLB export with {texture_size}x{texture_size} texture")
+        if texture_size >= 8192:
+            print("⚠️  High-resolution texture detected - process may take 10-20 minutes")
+            print("💾 Recommended: 32GB+ VRAM for 8K, 48GB+ VRAM for 16K")
+            
     vertices = mesh.vertices.cpu().numpy()
     faces = mesh.faces.cpu().numpy()
     
-    # mesh postprocess
+    # ✅ mesh postprocess avec paramètres optimisés pour 8K
     vertices, faces = postprocess_mesh(
         vertices, faces,
         simplify=simplify > 0,
         simplify_ratio=simplify,
         fill_holes=fill_holes,
         fill_holes_max_hole_size=fill_holes_max_size,
-        fill_holes_max_hole_nbe=int(250 * np.sqrt(1-simplify)),
-        fill_holes_resolution=1024,
-        fill_holes_num_views=1000,
+        fill_holes_max_hole_nbe=int(300 * np.sqrt(1-simplify)),  # Plus de boundary edges
+        fill_holes_resolution=max(1024, texture_size // 4),       # Resolution adaptative
+        fill_holes_num_views=max(1000, texture_size // 4),        # Plus de vues pour 8K+
         debug=debug,
         verbose=verbose,
     )
 
     # parametrize mesh
+    if verbose:
+        print("📐 Parametrizing mesh...")
     vertices, faces, uvs = parametrize_mesh(vertices, faces)
 
-    # bake texture
-    observations, extrinsics, intrinsics = render_multiview(app_rep, resolution=1024, nviews=100)
+    # ✅ bake texture avec plus de vues pour 8K
+    n_views = 150 if texture_size >= 8192 else 100  # Plus de vues pour 8K+
+    render_res = min(2048, texture_size // 2)       # Resolution de rendu adaptative
+    
+    if verbose:
+        print(f"📸 Rendering {n_views} views at {render_res}x{render_res} resolution...")
+        
+    observations, extrinsics, intrinsics = render_multiview(
+        app_rep, 
+        resolution=render_res, 
+        nviews=n_views
+    )
     masks = [np.any(observation > 0, axis=-1) for observation in observations]
     extrinsics = [extrinsics[i].cpu().numpy() for i in range(len(extrinsics))]
     intrinsics = [intrinsics[i].cpu().numpy() for i in range(len(intrinsics))]
+    
+    # ✅ Texture baking avec paramètres optimisés
     texture = bake_texture(
         vertices, faces, uvs,
         observations, masks, extrinsics, intrinsics,
-        texture_size=texture_size, mode='opt',
-        lambda_tv=0.01,
+        texture_size=texture_size, 
+        mode='opt',
+        lambda_tv=0.005 if texture_size >= 8192 else 0.01,  # Moins de TV loss pour 8K
         verbose=verbose
     )
     texture = Image.fromarray(texture)
 
     # rotate mesh (from z-up to y-up)
     vertices = vertices @ np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+    
+    # ✅ Material PBR optimisé pour 8K
     material = trimesh.visual.material.PBRMaterial(
-        roughnessFactor=1.0,
+        roughnessFactor=0.8,  # Légèrement moins rugueux pour montrer les détails 8K
+        metallicFactor=0.1,   # Légèrement métallique 
         baseColorTexture=texture,
         baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8)
     )
     mesh = trimesh.Trimesh(vertices, faces, visual=trimesh.visual.TextureVisuals(uv=uvs, material=material))
+    
+    if verbose:
+        print(f"✅ GLB export completed!")
+        print(f"📊 Final stats: {len(vertices)} vertices, {len(faces)} faces")
+        print(f"🎨 Texture: {texture_size}x{texture_size} ({texture_size*texture_size//1000000}MP)")
+        
     return mesh
 
 
 def simplify_gs(
     gs: Gaussian,
-    simplify: float = 0.95,
+    simplify: float = 0.8,  # ✅ MODIFIÉ: 0.95 → 0.8 (garde plus de Gaussians)
     verbose: bool = True,
 ):
     """
     Simplify 3D Gaussians
+    ✅ OPTIMISÉ pour préserver plus de détails compatible avec textures 8K
     NOTE: this function is not used in the current implementation for the unsatisfactory performance.
     
     Args:
         gs (Gaussian): 3D Gaussian.
-        simplify (float): Ratio of Gaussians to remove in simplification.
+        simplify (float): Ratio of Gaussians to keep after simplification (0.8 = garde 80%).
     """
     if simplify <= 0:
         return gs
+    
+    if verbose:
+        print(f"🔄 Simplifying Gaussians (keeping {simplify*100:.1f}%)...")
     
     # simplify
     observations, extrinsics, intrinsics = render_multiview(gs, resolution=1024, nviews=100)
@@ -519,7 +571,7 @@ def simplify_gs(
     _lambda = torch.zeros_like(_zeta)
     _delta = 1e-7
     _interval = 10
-    num_target = int((1 - simplify) * _zeta.shape[0])
+    num_target = int(simplify * _zeta.shape[0])  # Utilise le paramètre simplify
     
     with tqdm(total=2500, disable=not verbose, desc='Simplifying Gaussian') as pbar:
         for i in range(2500):

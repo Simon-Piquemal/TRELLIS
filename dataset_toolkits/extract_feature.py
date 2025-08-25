@@ -16,6 +16,8 @@ from queue import Queue
 from torchvision import transforms
 from PIL import Image
 
+# ✅ AJOUT : Import DINOv3 
+from transformers import AutoModel, AutoImageProcessor
 
 torch.set_grad_enabled(False)
 
@@ -58,7 +60,8 @@ if __name__ == '__main__':
                         help='Directory to save the metadata')
     parser.add_argument('--filter_low_aesthetic_score', type=float, default=None,
                         help='Filter objects with aesthetic score lower than this value')
-    parser.add_argument('--model', type=str, default='dinov2_vitl14_reg',
+    # 🔄 MODIFICATION 1 : Changer le modèle par défaut
+    parser.add_argument('--model', type=str, default='facebook/dinov3-vitl16-pretrain-lvd1689m',
                         help='Feature extraction model')
     parser.add_argument('--instances', type=str, default=None,
                         help='Instances to process')
@@ -68,12 +71,16 @@ if __name__ == '__main__':
     opt = parser.parse_args()
     opt = edict(vars(opt))
 
-    feature_name = opt.model
+    feature_name = opt.model.replace('/', '_')  # Nom de fichier safe
     os.makedirs(os.path.join(opt.output_dir, 'features', feature_name), exist_ok=True)
 
-    # load model
-    dinov2_model = torch.hub.load('facebookresearch/dinov2', opt.model)
-    dinov2_model.eval().cuda()
+    # 🔄 MODIFICATION 2 : Charger DINOv3 au lieu de DINOv2
+    print(f"🚀 Loading DINOv3: {opt.model}")
+    dinov3_model = AutoModel.from_pretrained(opt.model, torch_dtype=torch.float16)
+    dinov3_processor = AutoImageProcessor.from_pretrained(opt.model)
+    dinov3_model.eval().cuda()
+    
+    # Transform (gardé pour compatibilité mais DINOv3 processor s'en charge)
     transform = transforms.Compose([
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
@@ -159,9 +166,36 @@ if __name__ == '__main__':
                     batch_images = torch.stack([d['image'] for d in batch_data]).cuda()
                     batch_extrinsics = torch.stack([d['extrinsics'] for d in batch_data]).cuda()
                     batch_intrinsics = torch.stack([d['intrinsics'] for d in batch_data]).cuda()
-                    features = dinov2_model(batch_images, is_training=True)
+                    
+                    # 🔄 MODIFICATION 3 : Utiliser DINOv3 pour l'extraction de features
+                    with torch.no_grad():
+                        # Convertir les tenseurs en PIL Images pour le processor DINOv3
+                        pil_images = []
+                        for img_tensor in batch_images:
+                            # Dénormaliser si nécessaire et convertir en PIL
+                            img_np = img_tensor.cpu().permute(1, 2, 0).numpy()
+                            if img_np.max() <= 1.0:
+                                img_np = (img_np * 255).astype(np.uint8)
+                            else:
+                                img_np = img_np.astype(np.uint8)
+                            pil_images.append(Image.fromarray(img_np))
+                        
+                        # Process avec DINOv3
+                        inputs = dinov3_processor(pil_images, return_tensors="pt")
+                        inputs = {k: v.cuda() for k, v in inputs.items()}
+                        
+                        # Extract features
+                        outputs = dinov3_model(**inputs)
+                        
+                        # Obtenir les patch tokens (sans CLS token)
+                        patch_features = outputs.last_hidden_state[:, 1:]  # Shape: (bs, num_patches, hidden_dim)
+                        hidden_dim = patch_features.shape[-1]
+                        
+                        # Reshape en format spatial (37x37 pour 518x518 input)
+                        patchtokens = patch_features.reshape(bs, n_patch, n_patch, hidden_dim)
+                        patchtokens = patchtokens.permute(0, 3, 1, 2)  # (bs, hidden_dim, n_patch, n_patch)
+                    
                     uv = utils3d.torch.project_cv(positions, batch_extrinsics, batch_intrinsics)[0] * 2 - 1
-                    patchtokens = features['x_prenorm'][:, dinov2_model.num_register_tokens + 1:].permute(0, 2, 1).reshape(bs, 1024, n_patch, n_patch)
                     patchtokens_lst.append(patchtokens)
                     uv_lst.append(uv)
                 patchtokens = torch.cat(patchtokens_lst, dim=0)
@@ -176,4 +210,3 @@ if __name__ == '__main__':
         
     records = pd.DataFrame.from_records(records)
     records.to_csv(os.path.join(opt.output_dir, f'feature_{feature_name}_{opt.rank}.csv'), index=False)
-        
