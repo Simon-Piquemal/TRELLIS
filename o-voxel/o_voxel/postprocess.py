@@ -1,5 +1,6 @@
 from typing import *
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 import cv2
@@ -9,6 +10,55 @@ import trimesh.visual
 from flex_gemm.ops.grid_sample import grid_sample_3d
 import nvdiffrast.torch as dr
 import cumesh
+
+
+def _inpaint_channel(args):
+    """Helper function for parallel inpainting."""
+    img, mask, radius = args
+    return cv2.inpaint(img, mask, radius, cv2.INPAINT_TELEA)
+
+
+def _bvh_query_batch(args):
+    """Helper function for parallel BVH queries."""
+    bvh, points, return_uvw = args
+    return bvh.unsigned_distance(points, return_uvw=return_uvw)
+
+
+def _parallel_bvh_query(bvh, points, num_workers=8, batch_size=100000):
+    """
+    Parallelize BVH queries across multiple threads.
+
+    Args:
+        bvh: cumesh.cuBVH object
+        points: (N, 3) tensor of query points
+        num_workers: number of parallel workers
+        batch_size: points per batch
+
+    Returns:
+        distances, face_ids, uvw coordinates
+    """
+    n_points = points.shape[0]
+
+    # Si peu de points, pas besoin de paralléliser
+    if n_points < batch_size * 2:
+        return bvh.unsigned_distance(points, return_uvw=True)
+
+    # Diviser en batches
+    batches = []
+    for i in range(0, n_points, batch_size):
+        batch_points = points[i:i+batch_size]
+        batches.append((bvh, batch_points, True))
+
+    # Exécuter en parallèle
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        results = list(executor.map(_bvh_query_batch, batches))
+
+    # Combiner les résultats
+    distances = torch.cat([r[0] for r in results], dim=0)
+    face_ids = torch.cat([r[1] for r in results], dim=0)
+    uvws = torch.cat([r[2] for r in results], dim=0)
+
+    return distances, face_ids, uvws
 
 
 def to_glb(
@@ -31,6 +81,9 @@ def to_glb(
     mesh_cluster_smooth_strength=1,
     verbose: bool = False,
     use_tqdm: bool = False,
+    num_workers: int = 4,
+    rasterize_chunk_size: int = 100000,
+    bvh_batch_size: int = 100000,
 ):
     """
     Convert an extracted mesh to a GLB file.
@@ -56,6 +109,9 @@ def to_glb(
         mesh_cluster_smooth_strength: strength of smoothing for clustering in uv unwrapping
         verbose: whether to print verbose messages
         use_tqdm: whether to use tqdm to display progress bar
+        num_workers: number of parallel workers for CPU-bound operations (texture inpainting, BVH queries)
+        rasterize_chunk_size: number of faces to rasterize per chunk (increase for GPUs with more VRAM)
+        bvh_batch_size: number of points per BVH query batch (for parallel processing)
     """
     # --- Input Normalization (AABB, Voxel Size, Grid Size) ---
     if isinstance(aabb, (list, tuple)):
@@ -233,9 +289,10 @@ def to_glb(
     rast = torch.zeros((1, texture_size, texture_size, 4), device='cuda', dtype=torch.float32)
     
     # Rasterize in chunks to save memory
-    for i in range(0, out_faces.shape[0], 100000):
+    # For high-VRAM GPUs (e.g., RTX 5090 32GB), increase rasterize_chunk_size for fewer iterations
+    for i in range(0, out_faces.shape[0], rasterize_chunk_size):
         rast_chunk, _ = dr.rasterize(
-            ctx, uvs_rast, out_faces[i:i+100000],
+            ctx, uvs_rast, out_faces[i:i+rasterize_chunk_size],
             resolution=[texture_size, texture_size],
         )
         mask_chunk = rast_chunk[..., 3:4] > 0
@@ -251,7 +308,8 @@ def to_glb(
     
     # Map these positions back to the *original* high-res mesh to get accurate attributes
     # This corrects geometric errors introduced by simplification/remeshing
-    _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
+    # Parallelized BVH queries for multi-core CPUs (major speedup for high texel counts)
+    _, face_id, uvw = _parallel_bvh_query(bvh, valid_pos, num_workers=num_workers, batch_size=bvh_batch_size)
     orig_tri_verts = vertices[faces[face_id.long()]] # (N_new, 3, 3)
     valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
     
@@ -285,11 +343,20 @@ def to_glb(
     alpha_mode = 'OPAQUE'
     
     # Inpainting: fill gaps (dilation) to prevent black seams at UV boundaries
+    # Parallelized across 4 texture maps for ~4x speedup on multi-core CPUs
     mask_inv = (~mask).astype(np.uint8)
-    base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
-    metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
-    roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
-    alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+    inpaint_args = [
+        (base_color, mask_inv, 3),
+        (metallic, mask_inv, 1),
+        (roughness, mask_inv, 1),
+        (alpha, mask_inv, 1),
+    ]
+    with ThreadPoolExecutor(max_workers=min(num_workers, 4)) as executor:
+        results = list(executor.map(_inpaint_channel, inpaint_args))
+    base_color = results[0]
+    metallic = results[1][..., None]
+    roughness = results[2][..., None]
+    alpha = results[3][..., None]
     
     # Create PBR material
     # Standard PBR packs Metallic and Roughness into Blue and Green channels

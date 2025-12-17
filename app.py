@@ -504,6 +504,8 @@ def extract_glb(
         remesh_band=1,
         remesh_project=0,
         use_tqdm=True,
+        # Performance tuning: increase for high-VRAM GPUs (e.g., 500000 for 32GB VRAM)
+        rasterize_chunk_size=100000,
     )
     now = datetime.now()
     timestamp = now.strftime("%Y-%m-%dT%H%M%S") + f".{now.microsecond // 1000:03d}"
